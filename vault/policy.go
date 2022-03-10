@@ -6,10 +6,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/vault/sdk/logical"
+
+	"github.com/hashicorp/vault/helper/levenshtein"
+
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-secure-stdlib/parseutil"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
+	"github.com/hashicorp/hcl/hcl/token"
 	"github.com/hashicorp/vault/helper/identity"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/sdk/helper/hclutil"
@@ -500,4 +505,499 @@ func parsePaths(result *Policy, list *ast.ObjectList, performTemplating bool, en
 
 	result.Paths = paths
 	return nil
+}
+
+// ParseACLPolicy is used to parse the specified ACL rules into an
+// intermediary set of policies, before being compiled into
+// the ACL
+func ParseACLPolicyReturnDiagnostics(ns *namespace.Namespace, rules, filename string) (*Policy, logical.Diagnostics) {
+	return parseACLPolicyWithTemplatingReturnDiagnostics(ns, rules, false, nil, nil, filename)
+}
+
+// parseACLPolicyWithTemplating performs the actual work and checks whether we
+// should perform substitutions. If performTemplating is true we know that it
+// is templated so we don't check again, otherwise we check to see if it's a
+// templated policy.
+func parseACLPolicyWithTemplatingReturnDiagnostics(ns *namespace.Namespace, rules string, performTemplating bool, entity *identity.Entity, groups []*identity.Group, filename string) (*Policy, logical.Diagnostics) {
+	// Parse the rules
+	root, err := hcl.Parse(rules)
+	if err != nil {
+		return nil, logical.Diagnostics{
+			logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  "failed to parse policy",
+				Detail:   err.Error(),
+				Range:    &logical.DiagnosticRange{Filename: filename},
+			},
+		}
+	}
+
+	// Top-level item should be the object list
+	list, ok := root.Node.(*ast.ObjectList)
+	if !ok {
+		return nil, logical.Diagnostics{
+			logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  "failed to parse policy",
+				Detail:   "does not contain a root object",
+				Range:    toDiagnosticPos(root.Node.Pos(), filename),
+			},
+		}
+	}
+
+	var diagnostics logical.Diagnostics
+
+	// Check for invalid top-level keys
+	valid := []string{
+		"name",
+		"path",
+	}
+	if diags := checkHCLKeysReturnDiagnostics(list, valid, filename); len(diags) != 0 {
+		diagnostics = append(diagnostics, diags...)
+	}
+
+	// Create the initial policy and store the raw text of the rules
+	p := Policy{
+		Raw:       rules,
+		Type:      PolicyTypeACL,
+		namespace: ns,
+	}
+	if err := hcl.DecodeObject(&p, list); err != nil {
+		return nil, logical.Diagnostics{
+			logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  "failed to parse policy",
+				Detail:   err.Error(),
+			},
+		}
+	}
+
+	if o := list.Filter("path"); len(o.Items) > 0 {
+		if diags := parsePathsReturnDiagnostics(&p, o, performTemplating, entity, groups, filename); len(diags) != 0 {
+			diagnostics = append(diagnostics, diags...)
+		}
+	}
+
+	if len(diagnostics) != 0 {
+		return nil, diagnostics
+	}
+
+	return &p, nil
+}
+
+func parsePathsReturnDiagnostics(result *Policy, list *ast.ObjectList, performTemplating bool, entity *identity.Entity, groups []*identity.Group, filename string) logical.Diagnostics {
+	var diagnostics logical.Diagnostics
+
+	// Path to  map a path to it's position, could potentially use for diagnostic
+	pathLookup := make(map[string]bool)
+	denyPolicies := make([]string, 0)
+
+	paths := make([]*PathRules, 0, len(list.Items))
+
+	for i, item := range list.Items {
+		var nextPos token.Pos
+		if i+1 < len(list.Items) {
+			nextPos = list.Items[i+1].Pos()
+		}
+
+		key := "path"
+		if len(item.Keys) > 0 {
+			key = item.Keys[0].Token.Value().(string)
+		}
+
+		// Check the path
+		if performTemplating {
+			_, templated, err := identitytpl.PopulateString(identitytpl.PopulateStringInput{
+				Mode:        identitytpl.ACLTemplating,
+				String:      key,
+				Entity:      identity.ToSDKEntity(entity),
+				Groups:      identity.ToSDKGroups(groups),
+				NamespaceID: result.namespace.ID,
+			})
+			if err != nil {
+				continue
+			}
+			key = templated
+		} else {
+			hasTemplating, _, err := identitytpl.PopulateString(identitytpl.PopulateStringInput{
+				Mode:              identitytpl.ACLTemplating,
+				ValidityCheckOnly: true,
+				String:            key,
+			})
+			if err != nil {
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  "failed to validate policy templating",
+					Detail:   err.Error(),
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			}
+			if hasTemplating {
+				result.Templated = true
+			}
+		}
+
+		valid := []string{
+			"comment",
+			"policy",
+			"capabilities",
+			"allowed_parameters",
+			"denied_parameters",
+			"required_parameters",
+			"min_wrapping_ttl",
+			"max_wrapping_ttl",
+			"mfa_methods",
+			"control_group",
+		}
+		if diags := checkHCLKeysReturnDiagnostics(item.Val, valid, filename); len(diags) != 0 {
+			diagnostics = append(diagnostics, diags...)
+		}
+
+		var pc PathRules
+
+		// allocate memory so that DecodeObject can initialize the ACLPermissions struct
+		pc.Permissions = new(ACLPermissions)
+
+		pc.Path = key
+
+		if err := hcl.DecodeObject(&pc, item.Val); err != nil {
+			diagnostics = append(diagnostics, logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  fmt.Sprintf("failed to decode %q key", key),
+				Detail:   err.Error(),
+				Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+			})
+			continue
+		}
+
+		// Strip a leading '/' as paths in Vault start after the / in the API path
+		if len(pc.Path) > 0 && pc.Path[0] == '/' {
+			pc.Path = pc.Path[1:]
+		}
+
+		// Ensure we are using the full request path internally
+		pc.Path = result.namespace.Path + pc.Path
+
+		if strings.Contains(pc.Path, "+*") {
+			diagnostics = append(diagnostics, logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  fmt.Sprintf("path %q: invalid use of wildcards ('+*' is forbidden)", pc.Path),
+				Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+			})
+		}
+
+		if pc.Path == "+" || strings.Count(pc.Path, "/+") > 0 || strings.HasPrefix(pc.Path, "+/") {
+			pc.HasSegmentWildcards = true
+		}
+
+		if strings.HasSuffix(pc.Path, "*") {
+			// If there are segment wildcards, don't actually strip the
+			// trailing asterisk, but don't want to hit the default case
+			if !pc.HasSegmentWildcards {
+				// Strip the glob character if found
+				pc.Path = strings.TrimSuffix(pc.Path, "*")
+				pc.IsPrefix = true
+			}
+		}
+
+		if _, ok := pathLookup[pc.Path]; ok {
+			// Redundant path
+			diagnostics = append(diagnostics, logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityWarning,
+				Summary:  fmt.Sprintf("duplicate path detected %s", key),
+				Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+			})
+		} else {
+			// Set to current node position
+			pathLookup[pc.Path] = true
+		}
+
+		// Map old-style policies into capabilities
+		if len(pc.Policy) > 0 {
+			switch pc.Policy {
+			case OldDenyPathPolicy:
+				pc.Capabilities = []string{DenyCapability}
+			case OldReadPathPolicy:
+				pc.Capabilities = append(pc.Capabilities, []string{ReadCapability, ListCapability}...)
+			case OldWritePathPolicy:
+				pc.Capabilities = append(pc.Capabilities, []string{CreateCapability, ReadCapability, UpdateCapability, DeleteCapability, ListCapability}...)
+			case OldSudoPathPolicy:
+				pc.Capabilities = append(pc.Capabilities, []string{CreateCapability, ReadCapability, UpdateCapability, DeleteCapability, ListCapability, SudoCapability}...)
+			default:
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  fmt.Sprintf("path %q: invalid policy %q", key, pc.Policy),
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			}
+		}
+
+		// Initialize the map
+		pc.Permissions.CapabilitiesBitmap = 0
+		for _, cap := range pc.Capabilities {
+			switch cap {
+			// If it's deny, don't include any other capability
+			case DenyCapability:
+				denyPolicies = append(denyPolicies, pc.Path)
+				pc.Capabilities = []string{DenyCapability}
+				pc.Permissions.CapabilitiesBitmap = DenyCapabilityInt
+				goto PathFinished
+			case CreateCapability, ReadCapability, UpdateCapability, DeleteCapability, ListCapability, SudoCapability, PatchCapability:
+				pc.Permissions.CapabilitiesBitmap |= cap2Int[cap]
+			default:
+				summary := fmt.Sprintf("path %q: invalid capability %q", key, cap)
+				if guess, _ := levenshtein.BestNPossibilities(cap,
+					[]string{
+						CreateCapability,
+						ReadCapability,
+						UpdateCapability,
+						DeleteCapability,
+						ListCapability,
+						SudoCapability,
+						PatchCapability,
+					}, 4, 1); guess != nil {
+					summary = fmt.Sprintf("invalid capability \"%s\", did you mean \"%s\"", cap, guess[0].Word)
+				}
+
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  summary,
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			}
+		}
+
+		if pc.AllowedParametersHCL != nil {
+			pc.Permissions.AllowedParameters = make(map[string][]interface{}, len(pc.AllowedParametersHCL))
+			for key, val := range pc.AllowedParametersHCL {
+				pc.Permissions.AllowedParameters[strings.ToLower(key)] = val
+			}
+		}
+		if pc.DeniedParametersHCL != nil {
+			pc.Permissions.DeniedParameters = make(map[string][]interface{}, len(pc.DeniedParametersHCL))
+
+			for key, val := range pc.DeniedParametersHCL {
+				pc.Permissions.DeniedParameters[strings.ToLower(key)] = val
+			}
+		}
+		if pc.MinWrappingTTLHCL != nil {
+			dur, err := parseutil.ParseDurationSecond(pc.MinWrappingTTLHCL)
+			if err != nil {
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  "error parsing min_wrapping_ttl",
+					Detail:   err.Error(),
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			} else {
+				pc.Permissions.MinWrappingTTL = dur
+			}
+		}
+		if pc.MaxWrappingTTLHCL != nil {
+			dur, err := parseutil.ParseDurationSecond(pc.MaxWrappingTTLHCL)
+			if err != nil {
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  "error parsing max_wrapping_ttl",
+					Detail:   err.Error(),
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			} else {
+				pc.Permissions.MaxWrappingTTL = dur
+			}
+		}
+		if pc.MFAMethodsHCL != nil {
+			pc.Permissions.MFAMethods = make([]string, len(pc.MFAMethodsHCL))
+			for idx, item := range pc.MFAMethodsHCL {
+				pc.Permissions.MFAMethods[idx] = item
+			}
+		}
+		if pc.ControlGroupHCL != nil {
+			pc.Permissions.ControlGroup = new(ControlGroup)
+			if pc.ControlGroupHCL.TTL != nil {
+				dur, err := parseutil.ParseDurationSecond(pc.ControlGroupHCL.TTL)
+				if err != nil {
+					diagnostics = append(diagnostics, logical.Diagnostic{
+						Severity: logical.DiagnosticSeverityError,
+						Summary:  "error parsing control group max ttl",
+						Detail:   err.Error(),
+						Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+					})
+				} else {
+					pc.Permissions.ControlGroup.TTL = dur
+				}
+			}
+			var factors []*ControlGroupFactor
+			if pc.ControlGroupHCL.Factors != nil {
+				for key, factor := range pc.ControlGroupHCL.Factors {
+					// Although we only have one factor here, we need to check to make sure there is at least
+					// one factor defined in this factor block.
+					if factor.Identity == nil {
+						diagnostics = append(diagnostics, logical.Diagnostic{
+							Severity: logical.DiagnosticSeverityError,
+							Summary:  "no control_group factor provided",
+							Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+						})
+					}
+
+					if factor.Identity.ApprovalsRequired <= 0 ||
+						(len(factor.Identity.GroupIDs) == 0 && len(factor.Identity.GroupNames) == 0) {
+						diagnostics = append(diagnostics, logical.Diagnostic{
+							Severity: logical.DiagnosticSeverityError,
+							Summary:  "must provide more than one identity group and approvals > 0",
+							Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+						})
+					}
+
+					// Ensure that configured ControlledCapabilities for factor are a subset of the
+					// Capabilities of the policy.
+					if len(factor.ControlledCapabilities) > 0 {
+						var found bool
+						for _, controlledCapability := range factor.ControlledCapabilities {
+							found = false
+							for _, policyCap := range pc.Capabilities {
+								if controlledCapability == policyCap {
+									found = true
+								}
+							}
+							if !found {
+								diagnostics = append(diagnostics, logical.Diagnostic{
+									Severity: logical.DiagnosticSeverityError,
+									Summary:  ControlledCapabilityPolicySubsetError,
+									Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+								})
+							}
+						}
+					}
+
+					factors = append(factors, &ControlGroupFactor{
+						Name:                   key,
+						Identity:               factor.Identity,
+						ControlledCapabilities: factor.ControlledCapabilities,
+					})
+				}
+			}
+			if len(factors) == 0 {
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityError,
+					Summary:  "no control group factors provided",
+					Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+				})
+			}
+			pc.Permissions.ControlGroup.Factors = factors
+		}
+		if pc.Permissions.MinWrappingTTL != 0 &&
+			pc.Permissions.MaxWrappingTTL != 0 &&
+			pc.Permissions.MaxWrappingTTL < pc.Permissions.MinWrappingTTL {
+			diagnostics = append(diagnostics, logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  "max_wrapping_ttl cannot be less than min_wrapping_ttl",
+				Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+			})
+		}
+		if len(pc.RequiredParametersHCL) > 0 {
+			pc.Permissions.RequiredParameters = pc.RequiredParametersHCL[:]
+		}
+
+	PathFinished:
+		paths = append(paths, &pc)
+	}
+
+	result.Paths = paths
+
+	for _, p := range denyPolicies {
+		for k, _ := range pathLookup {
+			if strings.Contains(k, p) && k != p {
+				diagnostics = append(diagnostics, logical.Diagnostic{
+					Severity: logical.DiagnosticSeverityWarning,
+					Summary:  fmt.Sprintf("conflicting policies %q and %q", k, p),
+				})
+			}
+		}
+	}
+
+	if len(diagnostics) != 0 {
+		return diagnostics
+	}
+
+	return nil
+}
+
+// FIXME: copied from hclutil.CheckHCLKeys
+func checkHCLKeysReturnDiagnostics(node ast.Node, valid []string, filename string) logical.Diagnostics {
+	var list *ast.ObjectList
+	switch n := node.(type) {
+	case *ast.ObjectList:
+		list = n
+	case *ast.ObjectType:
+		list = n.List
+	default:
+		return logical.Diagnostics{
+			logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  fmt.Sprintf("cannot check HCL keys of type %T", node),
+				Range:    toDiagnosticPos(node.Pos(), filename),
+			},
+		}
+	}
+
+	validMap := make(map[string]struct{}, len(valid))
+	for _, v := range valid {
+		validMap[v] = struct{}{}
+	}
+
+	var diagnostics logical.Diagnostics
+
+	for i, item := range list.Items {
+		var nextPos token.Pos
+		if i+1 < len(list.Items) {
+			nextPos = list.Items[i+1].Pos()
+		}
+
+		key := item.Keys[0].Token.Value().(string)
+		if _, ok := validMap[key]; !ok {
+			summary := fmt.Sprintf("invalid key \"%s\"", key)
+			if guess, _ := levenshtein.BestNPossibilities(key, valid, -1, 1); guess != nil {
+				summary = fmt.Sprintf("invalid key \"%s\", did you mean \"%s\"", key, guess[0].Word)
+			}
+			diagnostics = append(diagnostics, logical.Diagnostic{
+				Severity: logical.DiagnosticSeverityError,
+				Summary:  summary,
+				Detail:   key,
+				Range:    toDiagnosticRange(item.Pos(), nextPos, filename),
+			})
+		}
+	}
+
+	return diagnostics
+}
+
+// toDiagnosticPos is a helper to extract diagnostic range from a single postion
+func toDiagnosticPos(pos token.Pos, filename string) *logical.DiagnosticRange {
+	return &logical.DiagnosticRange{
+		Filename: filename,
+		Start: &logical.Pos{
+			Line:   pos.Line,
+			Column: pos.Column,
+		},
+	}
+}
+
+// toDiagnosticRange is a helper to extract diagnostic range from a single postion
+func toDiagnosticRange(start token.Pos, end token.Pos, filename string) *logical.DiagnosticRange {
+	if end.Line < start.Line {
+		return toDiagnosticPos(start, filename)
+	}
+
+	return &logical.DiagnosticRange{
+		Filename: filename,
+		Start: &logical.Pos{
+			Line:   start.Line,
+			Column: start.Column,
+		},
+		End: &logical.Pos{
+			Line:   end.Line,
+			Column: end.Column,
+		},
+	}
 }

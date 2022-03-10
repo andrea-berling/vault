@@ -2455,9 +2455,13 @@ func (b *SystemBackend) handlePoliciesSet(policyType PolicyType) framework.Opera
 
 		switch policyType {
 		case PolicyTypeACL:
-			p, err := ParseACLPolicy(ns, policy.Raw)
-			if err != nil {
-				return handleError(err)
+			p, diags := ParseACLPolicyReturnDiagnostics(ns, policy.Raw, policy.Name)
+			if len(diags) > 0 {
+				err = mapstructure.Decode(diags, resp.Data)
+				if err != nil {
+					return logical.ErrorResponse("failed to decode diagnostics"), nil
+				}
+				return logical.RespondWithStatusCode(resp, req, http.StatusBadRequest)
 			}
 			policy.Paths = p.Paths
 			policy.Templated = p.Templated

@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/ghodss/yaml"
 	"github.com/hashicorp/vault/api"
 	"github.com/mitchellh/cli"
+	"github.com/mitchellh/colorstring"
 	"github.com/ryanuber/columnize"
 )
 
@@ -42,6 +44,26 @@ func OutputList(ui cli.Ui, data interface{}) int {
 
 func OutputData(ui cli.Ui, data interface{}) int {
 	return outputWithFormat(ui, nil, data)
+}
+
+func OutputDiagnostics(c *PolicyValidateCommand, data interface{}) int {
+	// unlike with other commands, we want pretty-printed output
+	// to be the default, not table
+	format := Format(c.UI)
+	if format == "table" {
+		format = "pretty"
+	}
+	formatter, ok := Formatters[format]
+	if !ok {
+		c.UI.Error(fmt.Sprintf("Invalid output format: %s", format))
+		return 1
+	}
+
+	if err := formatter.Output(c.UI, nil, data); err != nil {
+		c.UI.Error(fmt.Sprintf("Could not parse output: %s", err.Error()))
+		return 1
+	}
+	return 0
 }
 
 func outputWithFormat(ui cli.Ui, secret *api.Secret, data interface{}) int {
@@ -127,6 +149,8 @@ func (p PrettyFormatter) Output(ui cli.Ui, secret *api.Secret, data interface{})
 	switch data.(type) {
 	case *api.AutopilotState:
 		p.OutputAutopilotState(ui, data)
+	case Output:
+		p.OutputDiagnostics(ui, data)
 	default:
 		return errors.New("cannot use the pretty formatter for this type")
 	}
@@ -206,6 +230,81 @@ func (p PrettyFormatter) OutputAutopilotState(ui cli.Ui, data interface{}) {
 	}
 
 	ui.Output(buffer.String())
+}
+
+func (p PrettyFormatter) OutputDiagnostics(ui cli.Ui, data interface{}) {
+	output := data.(Output)
+
+	var buffer bytes.Buffer
+
+	// these leftRule* variables are markers for the beginning of the lines
+	var leftRuleLine, leftRuleStart, leftRuleEnd string
+
+	for i, diag := range output.Diagnostics {
+		switch diag.Severity {
+		case "error":
+			buffer.WriteString(colorstring.Color("[bold][red]Error: [reset]"))
+			leftRuleLine = colorstring.Color("[red]│[reset] ")
+			leftRuleStart = colorstring.Color("[red]╷[reset]")
+			leftRuleEnd = colorstring.Color("[red]╵[reset]")
+		case "warning":
+			buffer.WriteString(colorstring.Color("[bold][yellow]Warning: [reset]"))
+			leftRuleLine = colorstring.Color("[yellow]│[reset] ")
+			leftRuleStart = colorstring.Color("[yellow]╷[reset]")
+			leftRuleEnd = colorstring.Color("[yellow]╵[reset]")
+		default:
+			buffer.WriteString(colorstring.Color("\n[reset]"))
+		}
+
+		fmt.Fprintf(&buffer, colorstring.Color("[bold]%s[reset]\n\n"), diag.Summary)
+
+		var filename string
+		var lineStart int
+		var codeSnippet string
+		if diag.Range != nil {
+			filename = diag.Range.Filename
+			if &(diag.Range.Start) != nil {
+				lineStart = diag.Range.Start.Line
+			}
+		}
+		if diag.Snippet != nil {
+			codeSnippet = diag.Snippet.Code
+		}
+		buffer.WriteString(fmt.Sprintf("   on %s line %d:\n", filename, lineStart))
+		buffer.WriteString(fmt.Sprintf("     %d: %s\n", lineStart, codeSnippet))
+		buffer.WriteString(fmt.Sprintf("\n"))
+
+		if diag.Detail != "" {
+			buffer.WriteString(fmt.Sprintf(" %s\n", diag.Detail))
+			if len(output.Diagnostics) > i+1 {
+				buffer.WriteString(fmt.Sprintf("\n"))
+			}
+		}
+	}
+
+	// Before we write the output, we'll finally add the left rule prefixes to each
+	// line so that the overall message is visually delimited from what's
+	// around it. We'll do that by scanning over what we already generated
+	// and adding the prefix for each line.
+	var ruleBuf strings.Builder
+	sc := bufio.NewScanner(&buffer)
+	ruleBuf.WriteString(leftRuleStart)
+	ruleBuf.WriteByte('\n')
+	for sc.Scan() {
+		line := sc.Text()
+		prefix := leftRuleLine
+		if line == "" {
+			// Don't print the space after the line if there would be nothing
+			// after it anyway.
+			prefix = strings.TrimSpace(prefix)
+		}
+		ruleBuf.WriteString(prefix)
+		ruleBuf.WriteString(line)
+		ruleBuf.WriteByte('\n')
+	}
+	ruleBuf.WriteString(leftRuleEnd)
+
+	ui.Output(ruleBuf.String())
 }
 
 // An output formatter for table output of an object

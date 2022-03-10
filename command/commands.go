@@ -542,6 +542,11 @@ func initCommands(ui, serverCmdUi cli.Ui, runOpts *RunOptions) {
 				BaseCommand: getBaseCommand(),
 			}, nil
 		},
+		"policy validate": func() (cli.Command, error) {
+			return &PolicyValidateCommand{
+				BaseCommand: getBaseCommand(),
+			}, nil
+		},
 		"policy write": func() (cli.Command, error) {
 			return &PolicyWriteCommand{
 				BaseCommand: getBaseCommand(),

@@ -36,10 +36,7 @@ export default Mixin.create({
           }
           return this.transitionToRoute('vault.cluster.policy.show', m.get('policyType'), m.get('name'));
         })
-        .catch(() => {
-          // do nothing here...
-          // message-error component will show errors
-        });
+        .catch(() => {});
     },
 
     setModelName(model, e) {

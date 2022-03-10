@@ -2457,11 +2457,42 @@ func (b *SystemBackend) handlePoliciesSet(policyType PolicyType) framework.Opera
 		case PolicyTypeACL:
 			p, diags := ParseACLPolicyReturnDiagnostics(ns, policy.Raw, policy.Name)
 			if len(diags) > 0 {
-				err = mapstructure.Decode(diags, resp.Data)
-				if err != nil {
-					return logical.ErrorResponse("failed to decode diagnostics"), nil
+				var (
+					errorCount   int
+					warningCount int
+				)
+
+				if resp == nil {
+					resp = &logical.Response{
+						Data: map[string]interface{}{
+							logical.HTTPContentType: "application/json",
+							logical.HTTPStatusCode:  http.StatusBadRequest,
+						},
+					}
 				}
-				return logical.RespondWithStatusCode(resp, req, http.StatusBadRequest)
+
+				for _, d := range diags {
+					if d.Severity == logical.DiagnosticSeverityError {
+						errorCount++
+					} else {
+						warningCount++
+					}
+				}
+
+				diagResp := logical.DiagnosticResponse{
+					FormatVersion: "1",
+					Valid:         true,
+					ErrorCount:    errorCount,
+					WarningCount:  warningCount,
+					Diagnostics:   diags,
+				}
+
+				body, err := json.Marshal(diagResp)
+				if err != nil {
+					return logical.ErrorResponse("failed to encode diagnostics"), nil
+				}
+				resp.Data[logical.HTTPRawBody] = string(body)
+				return resp, nil
 			}
 			policy.Paths = p.Paths
 			policy.Templated = p.Templated

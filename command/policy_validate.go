@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"github.com/hashicorp/vault/sdk/logical"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -13,18 +14,6 @@ import (
 	homedir "github.com/mitchellh/go-homedir"
 	"github.com/posener/complete"
 )
-
-type Output struct {
-	FormatVersion string `json:"format_version"`
-
-	// We include some summary information that is actually redundant
-	// with the detailed diagnostics, but avoids the need for callers
-	// to re-implement our logic for deciding these.
-	Valid        bool               `json:"valid"`
-	ErrorCount   int                `json:"error_count"`
-	WarningCount int                `json:"warning_count"`
-	Diagnostics  []vault.Diagnostic `json:"diagnostics"`
-}
 
 var (
 	_ cli.Command             = (*PolicyValidateCommand)(nil)
@@ -85,7 +74,7 @@ func (c *PolicyValidateCommand) Run(args []string) int {
 		return 1
 	}
 
-	var diags vault.Diagnostics
+	var diags logical.Diagnostics
 
 	switch {
 	case args[0] == "-":
@@ -117,21 +106,21 @@ func (c *PolicyValidateCommand) Run(args []string) int {
 	return 0
 }
 
-func formOutput(diagnostics vault.Diagnostics) Output {
+func formOutput(diagnostics logical.Diagnostics) logical.DiagnosticResponse {
 	var (
 		errorCount   int
 		warningCount int
 	)
 
 	for _, d := range diagnostics {
-		if d.Severity == vault.DiagnosticSeverityError {
+		if d.Severity == logical.DiagnosticSeverityError {
 			errorCount++
 		} else {
 			warningCount++
 		}
 	}
 
-	return Output{
+	return logical.DiagnosticResponse{
 		FormatVersion: "1",
 		Valid:         errorCount == 0,
 		ErrorCount:    errorCount,

@@ -3,9 +3,11 @@ package api
 import (
 	"bytes"
 	"fmt"
+	"github.com/hashicorp/vault/sdk/logical"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/vault/sdk/helper/consts"
 	"github.com/hashicorp/vault/sdk/helper/jsonutil"
@@ -56,10 +58,18 @@ func (r *Response) Error() error {
 	// in a bytes.Reader here so that the JSON decoder doesn't move the
 	// read pointer for the original buffer.
 	var resp ErrorResponse
-	if err := jsonutil.DecodeJSON(bodyBuf.Bytes(), &resp); err != nil {
+	if err := jsonutil.DecodeJSON(bodyBuf.Bytes(), &resp); err != nil || len(resp.Errors) == 0 {
 		// Store the fact that we couldn't decode the errors
-		respErr.RawError = true
-		respErr.Errors = []string{bodyBuf.String()}
+		var diagResp logical.DiagnosticResponse
+		if err := jsonutil.DecodeJSON(bodyBuf.Bytes(), &diagResp); err != nil {
+			respErr.RawError = true
+			respErr.Errors = []string{bodyBuf.String()}
+		} else {
+			respErr.Errors = make([]string, len(diagResp.Diagnostics))
+			for i, d := range diagResp.Diagnostics {
+				respErr.Errors[i] = fmt.Sprintf("%s: %s on line %d \n", strings.Title(d.Severity), d.Summary, d.Range.Start.Line)
+			}
+		}
 	} else {
 		// Store the decoded errors
 		respErr.Errors = resp.Errors

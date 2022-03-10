@@ -1,4 +1,4 @@
-package vault
+package logical
 
 // These severities map to the tfdiags.Severity values, plus an explicit
 // unknown in case that enum grows without us noticing here.
@@ -7,6 +7,20 @@ const (
 	DiagnosticSeverityError   = "error"
 	DiagnosticSeverityWarning = "warning"
 )
+
+// DiagnosticResponse is a wrapper to return diagnostics to HTTP calls
+// and a total hack
+type DiagnosticResponse struct {
+	FormatVersion string `json:"format_version"`
+
+	// We include some summary information that is actually redundant
+	// with the detailed diagnostics, but avoids the need for callers
+	// to re-implement our logic for deciding these.
+	Valid        bool         `json:"valid"`
+	ErrorCount   int          `json:"error_count"`
+	WarningCount int          `json:"warning_count"`
+	Diagnostics  []Diagnostic `json:"diagnostics"`
+}
 
 // Diagnostics is a list of diagnostics. Diagnostics is intended to be used
 // where a Go "error" might normally be used, allowing richer information

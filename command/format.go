@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hashicorp/vault/sdk/logical"
 	"os"
 	"sort"
 	"strings"
@@ -149,7 +150,7 @@ func (p PrettyFormatter) Output(ui cli.Ui, secret *api.Secret, data interface{})
 	switch data.(type) {
 	case *api.AutopilotState:
 		p.OutputAutopilotState(ui, data)
-	case Output:
+	case logical.DiagnosticResponse:
 		p.OutputDiagnostics(ui, data)
 	default:
 		return errors.New("cannot use the pretty formatter for this type")
@@ -233,7 +234,7 @@ func (p PrettyFormatter) OutputAutopilotState(ui cli.Ui, data interface{}) {
 }
 
 func (p PrettyFormatter) OutputDiagnostics(ui cli.Ui, data interface{}) {
-	output := data.(Output)
+	output := data.(logical.DiagnosticResponse)
 
 	var buffer bytes.Buffer
 
